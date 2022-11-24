@@ -41,7 +41,7 @@ from diffusers import (
 )
 from diffusers.pipelines.latent_diffusion.pipeline_latent_diffusion import LDMBertConfig, LDMBertModel
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
-from transformers import AutoFeatureExtractor, BertTokenizerFast, CLIPTextModel, CLIPTokenizer
+from transformers import AutoFeatureExtractor, BertTokenizerFast, CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPFeatureExtractor, AutoTokenizer
 
 
 def shave_segments(path, n_shave_prefix_segments=1):
@@ -229,6 +229,11 @@ def create_unet_diffusers_config(original_config):
         up_block_types.append(block_type)
         resolution //= 2
 
+    if hasattr(unet_params, "num_head_channels"):
+        attention_head_dim = [ch // unet_params.num_head_channels for ch in block_out_channels]
+    else:
+        attention_head_dim=unet_params.num_heads
+
     config = dict(
         sample_size=unet_params.image_size,
         in_channels=unet_params.in_channels,
@@ -238,7 +243,8 @@ def create_unet_diffusers_config(original_config):
         block_out_channels=tuple(block_out_channels),
         layers_per_block=unet_params.num_res_blocks,
         cross_attention_dim=unet_params.context_dim,
-        attention_head_dim=unet_params.num_heads,
+        attention_head_dim=attention_head_dim,
+        use_linear_projection=unet_params.use_linear_in_transformer
     )
 
     return config
@@ -679,6 +685,11 @@ if __name__ == "__main__":
     num_train_timesteps = original_config.model.params.timesteps
     beta_start = original_config.model.params.linear_start
     beta_end = original_config.model.params.linear_end
+    parameterization = getattr(original_config.model.params, "parameterization", None)
+
+    if parameterization == "v" and args.scheduler_type not in set(("ddim", "euler")):
+        raise ValueError(f"Scheduler of type {args.scheduler_type} doesn't support v-parameterization")
+
     if args.scheduler_type == "pndm":
         scheduler = PNDMScheduler(
             beta_end=beta_end,
@@ -690,7 +701,12 @@ if __name__ == "__main__":
     elif args.scheduler_type == "lms":
         scheduler = LMSDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear")
     elif args.scheduler_type == "euler":
-        scheduler = EulerDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear")
+        scheduler = EulerDiscreteScheduler(
+            beta_start=beta_start, 
+            beta_end=beta_end, 
+            beta_schedule="scaled_linear", 
+            prediction_type="velocity" if parameterization == "v" else "epsilon"
+        )
     elif args.scheduler_type == "euler-ancestral":
         scheduler = EulerAncestralDiscreteScheduler(
             beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear"
@@ -706,6 +722,7 @@ if __name__ == "__main__":
             beta_schedule="scaled_linear",
             clip_sample=False,
             set_alpha_to_one=False,
+            prediction_type="velocity" if parameterization == "v" else "epsilon"
         )
     else:
         raise ValueError(f"Scheduler of type {args.scheduler_type} doesn't exist!")
@@ -733,6 +750,20 @@ if __name__ == "__main__":
         tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
         safety_checker = StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker")
         feature_extractor = AutoFeatureExtractor.from_pretrained("CompVis/stable-diffusion-safety-checker")
+        pipe = StableDiffusionPipeline(
+            vae=vae,
+            text_encoder=text_model,
+            tokenizer=tokenizer,
+            unet=unet,
+            scheduler=scheduler,
+            safety_checker=safety_checker,
+            feature_extractor=feature_extractor,
+        )
+    elif text_model_type == "FrozenOpenCLIPEmbedder":
+        text_model = CLIPTextModel.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        tokenizer = AutoTokenizer.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        safety_checker = None # TODO !! StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker")
+        feature_extractor = CLIPFeatureExtractor.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
         pipe = StableDiffusionPipeline(
             vae=vae,
             text_encoder=text_model,
